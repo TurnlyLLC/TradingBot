@@ -777,22 +777,37 @@ def compute_label_from_snapshots(signal_row: sqlite3.Row, snaps: List[sqlite3.Ro
 # ==============================
 
 
+import tempfile
+
 class SignalCollectorApp:
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
         api_key = os.environ.get("KALSHI_API_KEY_ID", "").strip()
         key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "").strip()
+        key_pem = os.environ.get("KALSHI_PRIVATE_KEY_PEM", "").strip()
+
         if not api_key:
             raise SystemExit("Missing KALSHI_API_KEY_ID")
+
+        if key_pem:
+            tmp_dir = "/app/data" if os.path.exists("/app/data") else tempfile.gettempdir()
+            temp_key_path = os.path.join(tmp_dir, "kalshi_private_key.pem")
+            with open(temp_key_path, "w", encoding="utf-8") as f:
+                f.write(key_pem)
+            key_path = temp_key_path
+
         if not key_path or not os.path.exists(key_path):
-            raise SystemExit("Missing or invalid KALSHI_PRIVATE_KEY_PATH")
+            raise SystemExit(
+                "Missing or invalid Kalshi private key. "
+                "Use KALSHI_PRIVATE_KEY_PEM or KALSHI_PRIVATE_KEY_PATH."
+            )
 
         self.auth = KalshiAuth(api_key, key_path)
         self.rest = KalshiREST(self.auth, cfg.rest_base_url, cfg.timeout_seconds)
         self.db = CollectorDB(cfg.db_path)
 
-        self.markets_meta: Dict[str, Dict[str, Any]] = {}
-        self.states: Dict[str, MarketRealtimeState] = {}
+        self.markets_meta = {}
+        self.states = {}
         self.ws = None
         self.last_universe_refresh = 0
         self.last_snapshot_flush = 0
