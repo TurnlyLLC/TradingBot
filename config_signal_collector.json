@@ -1,0 +1,15 @@
+{
+  "required_min_yes_price_cents": 85,
+  "required_max_yes_price_cents": 97,
+  "max_spread_cents": 4,
+  "min_volume_contracts": 25.0,
+  "min_open_interest_contracts": 10.0,
+  "per_market_signal_cooldown_seconds": 120,
+  "label_horizon_seconds": 600,
+  "refresh_universe_every_seconds": 300,
+  "snapshot_every_seconds": 10,
+  "summary_every_seconds": 60,
+  "db_path": "/app/data/signal_collector.db",
+  "runtime_log_path": "/app/data/logs/signal_collector_runtime.log",
+  "state_json_path": "/app/data/signal_collector_state.json"
+}
