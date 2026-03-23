@@ -793,7 +793,7 @@ class SignalCollectorApp:
             tmp_dir = "/app/data" if os.path.exists("/app/data") else tempfile.gettempdir()
             temp_key_path = os.path.join(tmp_dir, "kalshi_private_key.pem")
             with open(temp_key_path, "w", encoding="utf-8") as f:
-                f.write(key_pem)
+                f.write(key_pem.replace("\\n", "\n"))
             key_path = temp_key_path
 
         if not key_path or not os.path.exists(key_path):
@@ -806,14 +806,14 @@ class SignalCollectorApp:
         self.rest = KalshiREST(self.auth, cfg.rest_base_url, cfg.timeout_seconds)
         self.db = CollectorDB(cfg.db_path)
 
-        self.markets_meta = {}
-        self.states = {}
+        self.markets_meta: Dict[str, Dict[str, Any]] = {}
+        self.states: Dict[str, MarketRealtimeState] = {}
         self.ws = None
         self.last_universe_refresh = 0
         self.last_snapshot_flush = 0
         self.last_summary = 0
         self.run_started_ts = now_ts()
-
+        
     def refresh_universe(self) -> None:
         markets = self.rest.get_all_open_markets(limit=100000)
         new_meta: Dict[str, Dict[str, Any]] = {}
@@ -1061,7 +1061,18 @@ def load_config(path: Optional[str]) -> CollectorConfig:
             setattr(cfg, k, v)
     return cfg
 
-
+async def run(self) -> None:
+    try:
+        log_line(self.cfg, "collector starting")
+        self.refresh_universe()
+        log_line(self.cfg, f"collector universe loaded markets={len(self.markets_meta)}")
+        await asyncio.gather(
+            self.ws_loop(),
+            self.periodic_loop(),
+        )
+    except Exception as e:
+        log_line(self.cfg, f"collector fatal error: {e}")
+        raise
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=None)
