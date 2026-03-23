@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import atexit
-import json
 import os
 import shutil
 import signal
@@ -109,7 +108,13 @@ class CollectorManager:
         }
 
     def monitor(self) -> None:
-        self.start()
+        try:
+            self.start()
+        except Exception as e:
+            self.last_exit_code = 1
+            log(f"collector_start_failed error={e}")
+            return
+
         while not self.stop_event.is_set():
             if self.process is None:
                 time.sleep(2)
@@ -124,7 +129,12 @@ class CollectorManager:
             self.restart_count += 1
             log(f"collector_crashed exit_code={code} restarting=true")
             time.sleep(5)
-            self.start()
+            try:
+                self.start()
+            except Exception as e:
+                self.last_exit_code = 1
+                log(f"collector_restart_failed error={e}")
+                time.sleep(10)
 
 
 class BackupManager:
@@ -154,12 +164,13 @@ class BackupManager:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         backup_db = BACKUP_DIR / f"signal_collector_{ts}.db"
         shutil.copy2(DB_PATH, backup_db)
-        if APP_LOG.exists():
-            shutil.copy2(APP_LOG, BACKUP_DIR / f"railway_app_{ts}.log")
-        if COLLECTOR_STDOUT.exists():
-            shutil.copy2(COLLECTOR_STDOUT, BACKUP_DIR / f"collector_stdout_{ts}.log")
-        if COLLECTOR_STDERR.exists():
-            shutil.copy2(COLLECTOR_STDERR, BACKUP_DIR / f"collector_stderr_{ts}.log")
+        for src, name in [
+            (APP_LOG, f"railway_app_{ts}.log"),
+            (COLLECTOR_STDOUT, f"collector_stdout_{ts}.log"),
+            (COLLECTOR_STDERR, f"collector_stderr_{ts}.log"),
+        ]:
+            if src.exists():
+                shutil.copy2(src, BACKUP_DIR / name)
         self.last_backup_file = str(backup_db)
         self.last_backup_ts = int(time.time())
         self.last_backup_error = None
@@ -167,12 +178,9 @@ class BackupManager:
         if self.s3:
             try:
                 self.s3.upload_file(str(backup_db), self.bucket, f"backups/{backup_db.name}")
-                if APP_LOG.exists():
-                    self.s3.upload_file(str(APP_LOG), self.bucket, f"logs/{APP_LOG.name}")
-                if COLLECTOR_STDOUT.exists():
-                    self.s3.upload_file(str(COLLECTOR_STDOUT), self.bucket, f"logs/{COLLECTOR_STDOUT.name}")
-                if COLLECTOR_STDERR.exists():
-                    self.s3.upload_file(str(COLLECTOR_STDERR), self.bucket, f"logs/{COLLECTOR_STDERR.name}")
+                for src in [APP_LOG, COLLECTOR_STDOUT, COLLECTOR_STDERR]:
+                    if src.exists():
+                        self.s3.upload_file(str(src), self.bucket, f"logs/{src.name}")
             except Exception as e:
                 self.last_backup_error = str(e)
                 log(f"backup_upload_error error={e}")
@@ -289,7 +297,7 @@ DASHBOARD_HTML = """
     </table>
   </div>
   <div class="row muted">
-    <a href="/api/dashboard">JSON</a> · <a href="/download/db">Download DB</a> · <a href="/health">Health</a>
+    <a href="/api/dashboard">JSON</a> · <a href="/download/db">Download DB</a> · <a href="/health">Health</a> · <a href="/admin/logs/collector-stderr">Collector stderr</a> · <a href="/admin/logs/collector-stdout">Collector stdout</a>
   </div>
 </body>
 </html>
@@ -330,15 +338,8 @@ def dashboard_payload() -> Dict[str, Any]:
     bad24 = query_one("SELECT COUNT(*) AS n FROM signal_events WHERE label_ts >= ? AND label_quality = 0", (since,))
     tracked = query_one("SELECT value FROM collector_stats WHERE key = 'last_universe_market_count'")
     recent = query_all(
-        """
-        SELECT market_ticker, signal_type, hypothetical_entry_price_cents, label_result, label_quality, created_ts
-        FROM signal_events
-        WHERE label_ts IS NOT NULL
-        ORDER BY label_ts DESC
-        LIMIT 50
-        """
+        "SELECT market_ticker, signal_type, hypothetical_entry_price_cents, label_result, label_quality, created_ts FROM signal_events WHERE label_ts IS NOT NULL ORDER BY label_ts DESC LIMIT 50"
     )
-
     recent_rows = []
     for r in recent:
         recent_rows.append({
@@ -349,7 +350,6 @@ def dashboard_payload() -> Dict[str, Any]:
             "label_quality": r["label_quality"],
             "created_at": datetime.fromtimestamp(r["created_ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         })
-
     metrics = {
         "signals_last_24h": int(signals24["n"]) if signals24 else 0,
         "labeled_last_24h": int(labeled24["n"]) if labeled24 else 0,
@@ -404,6 +404,28 @@ def admin_restart():
     return jsonify({"ok": True})
 
 
+@app.route('/admin/logs/collector-stderr')
+def collector_stderr():
+    if not COLLECTOR_STDERR.exists():
+        return jsonify({"error": "collector stderr log not found"}), 404
+    try:
+        text = COLLECTOR_STDERR.read_text(encoding='utf-8', errors='replace')
+        return f"<pre>{text[-20000:]}</pre>"
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/logs/collector-stdout')
+def collector_stdout():
+    if not COLLECTOR_STDOUT.exists():
+        return jsonify({"error": "collector stdout log not found"}), 404
+    try:
+        text = COLLECTOR_STDOUT.read_text(encoding='utf-8', errors='replace')
+        return f"<pre>{text[-20000:]}</pre>"
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def boot_background_workers() -> None:
     collector.monitor_thread = threading.Thread(target=collector.monitor, daemon=True)
     collector.monitor_thread.start()
@@ -425,23 +447,3 @@ if __name__ == '__main__':
     boot_background_workers()
     port = int(os.getenv('PORT', '8080'))
     app.run(host='0.0.0.0', port=port, threaded=True)
-    @app.route('/admin/logs/collector-stderr')
-def collector_stderr():
-    if not COLLECTOR_STDERR.exists():
-        return jsonify({"error": "collector stderr log not found"}), 404
-    try:
-        text = COLLECTOR_STDERR.read_text(encoding="utf-8", errors="replace")
-        return f"<pre>{text[-20000:]}</pre>"
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/admin/logs/collector-stdout')
-def collector_stdout():
-    if not COLLECTOR_STDOUT.exists():
-        return jsonify({"error": "collector stdout log not found"}), 404
-    try:
-        text = COLLECTOR_STDOUT.read_text(encoding="utf-8", errors="replace")
-        return f"<pre>{text[-20000:]}</pre>"
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
