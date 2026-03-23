@@ -425,3 +425,23 @@ if __name__ == '__main__':
     boot_background_workers()
     port = int(os.getenv('PORT', '8080'))
     app.run(host='0.0.0.0', port=port, threaded=True)
+    @app.route('/admin/logs/collector-stderr')
+def collector_stderr():
+    if not COLLECTOR_STDERR.exists():
+        return jsonify({"error": "collector stderr log not found"}), 404
+    try:
+        text = COLLECTOR_STDERR.read_text(encoding="utf-8", errors="replace")
+        return f"<pre>{text[-20000:]}</pre>"
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/logs/collector-stdout')
+def collector_stdout():
+    if not COLLECTOR_STDOUT.exists():
+        return jsonify({"error": "collector stdout log not found"}), 404
+    try:
+        text = COLLECTOR_STDOUT.read_text(encoding="utf-8", errors="replace")
+        return f"<pre>{text[-20000:]}</pre>"
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
