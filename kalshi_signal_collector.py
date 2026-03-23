@@ -5,23 +5,13 @@ Kalshi Signal Collector
 Standalone, non-trading data-collection bot.
 
 Purpose
-- Scan a broad Kalshi market universe (all open markets available from GET /markets)
+- Scan a broad Kalshi market universe (open markets from GET /markets)
 - Apply hard safety filters only
-- Log all candidate signals, not just executed trades
+- Log candidate signals, not executed trades
 - Label those signals after a fixed forward window
 - Produce a SQLite dataset suitable for ML training
 
 This bot NEVER places orders.
-
-Dependencies:
-    pip install requests websockets cryptography
-
-Environment:
-    KALSHI_API_KEY_ID=...
-    KALSHI_PRIVATE_KEY_PATH=/full/path/to/private_key.pem
-
-Usage:
-    python kalshi_signal_collector.py --config config_signal_collector.json
 """
 
 from __future__ import annotations
@@ -35,10 +25,11 @@ import os
 import sqlite3
 import ssl
 import statistics
+import tempfile
 import time
 import uuid
-from collections import defaultdict, deque
-from dataclasses import dataclass, field, asdict
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,22 +39,16 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 
-# ==============================
-# Config
-# ==============================
-
 @dataclass
 class CollectorConfig:
     rest_base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     timeout_seconds: int = 20
 
-    # Universe
     include_all_open_markets: bool = True
     markets_page_limit: int = 1000
-    refresh_universe_every_seconds: int = 300
+    refresh_universe_every_seconds: int = 900
 
-    # Hard filters only
     required_min_yes_price_cents: int = 85
     required_max_yes_price_cents: int = 97
     max_spread_cents: int = 4
@@ -71,28 +56,20 @@ class CollectorConfig:
     min_open_interest_contracts: float = 10.0
     min_recent_history_points: int = 10
     min_hours_to_close: float = 0.10
-    max_hours_to_close: float = 336.0  # 14 days
+    max_hours_to_close: float = 336.0
 
-    # Candidate logging cadence
     per_market_signal_cooldown_seconds: int = 120
     label_horizon_seconds: int = 600
     log_all_filtered_candidates: bool = True
 
-    # Outcome thresholds for hypothetical label
     target_return_pct: float = 0.02
     stop_return_pct: float = 0.03
 
-    # Runtime
     db_path: str = "signal_collector.db"
     state_json_path: str = "signal_collector_state.json"
     runtime_log_path: str = "signal_collector_runtime.log"
     snapshot_every_seconds: int = 10
     summary_every_seconds: int = 60
-
-
-# ==============================
-# Helpers
-# ==============================
 
 
 def utc_now() -> datetime:
@@ -169,11 +146,6 @@ def log_line(cfg: CollectorConfig, msg: str) -> None:
         f.write(line + "\n")
 
 
-# ==============================
-# DB
-# ==============================
-
-
 class CollectorDB:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path)
@@ -200,7 +172,6 @@ class CollectorDB:
                 hypothetical_stop_price_cents INTEGER NOT NULL,
                 close_ts INTEGER,
                 hours_to_close REAL,
-
                 yes_bid_cents INTEGER,
                 yes_ask_cents INTEGER,
                 no_bid_cents INTEGER,
@@ -210,7 +181,6 @@ class CollectorDB:
                 yes_ask_size REAL,
                 volume REAL,
                 open_interest REAL,
-
                 momentum_10 REAL,
                 momentum_30 REAL,
                 momentum_60 REAL,
@@ -222,7 +192,6 @@ class CollectorDB:
                 rank_score REAL,
                 reason_codes_json TEXT,
                 metadata_json TEXT,
-
                 label_ts INTEGER,
                 label_result TEXT,
                 label_hit_target_first INTEGER,
@@ -238,12 +207,7 @@ class CollectorDB:
             )
             """
         )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_signal_status_created
-            ON signal_events(status, created_ts)
-            """
-        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_status_created ON signal_events(status, created_ts)")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -271,12 +235,7 @@ class CollectorDB:
             )
             """
         )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_snap_market_ts
-            ON market_snapshots(market_ticker, ts)
-            """
-        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_snap_market_ts ON market_snapshots(market_ticker, ts)")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS collector_stats (
@@ -313,23 +272,14 @@ class CollectorDB:
     def get_pending_signals_ready_for_label(self, cutoff_ts: int, limit: int = 1000) -> List[sqlite3.Row]:
         cur = self.conn.cursor()
         return cur.execute(
-            """
-            SELECT * FROM signal_events
-            WHERE status = 'pending' AND created_ts <= ?
-            ORDER BY created_ts ASC
-            LIMIT ?
-            """,
+            "SELECT * FROM signal_events WHERE status = 'pending' AND created_ts <= ? ORDER BY created_ts ASC LIMIT ?",
             (cutoff_ts, limit),
         ).fetchall()
 
     def get_snapshots_for_window(self, ticker: str, start_ts: int, end_ts: int) -> List[sqlite3.Row]:
         cur = self.conn.cursor()
         return cur.execute(
-            """
-            SELECT * FROM market_snapshots
-            WHERE market_ticker = ? AND ts BETWEEN ? AND ?
-            ORDER BY ts ASC
-            """,
+            "SELECT * FROM market_snapshots WHERE market_ticker = ? AND ts BETWEEN ? AND ? ORDER BY ts ASC",
             (ticker, start_ts, end_ts),
         ).fetchall()
 
@@ -342,18 +292,11 @@ class CollectorDB:
 
     def summary_counts(self) -> Dict[str, int]:
         cur = self.conn.cursor()
-        rows = cur.execute(
-            "SELECT status, COUNT(*) AS n FROM signal_events GROUP BY status"
-        ).fetchall()
+        rows = cur.execute("SELECT status, COUNT(*) AS n FROM signal_events GROUP BY status").fetchall()
         out = {"pending": 0, "labeled": 0}
         for r in rows:
             out[r["status"]] = r["n"]
         return out
-
-
-# ==============================
-# Kalshi auth / REST
-# ==============================
 
 
 class KalshiAuth:
@@ -366,10 +309,7 @@ class KalshiAuth:
         msg = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
         sig = self.private_key.sign(
             msg,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
-            ),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
             hashes.SHA256(),
         )
         return base64.b64encode(sig).decode("utf-8")
@@ -418,7 +358,7 @@ class KalshiREST:
             params["cursor"] = cursor
         return self._request("GET", "/markets", params=params, auth_required=False)
 
-    def get_all_open_markets(self, limit: int = 100000) -> List[Dict[str, Any]]:
+    def get_all_open_markets(self, limit: int = 3000) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
         while len(out) < limit:
@@ -433,11 +373,6 @@ class KalshiREST:
         return out
 
 
-# ==============================
-# Realtime state
-# ==============================
-
-
 @dataclass
 class MarketRealtimeState:
     ticker: str
@@ -445,21 +380,17 @@ class MarketRealtimeState:
     title: str = ""
     category: str = ""
     close_ts: Optional[int] = None
-
     yes_bid_cents: Optional[int] = None
     yes_ask_cents: Optional[int] = None
     no_bid_cents: Optional[int] = None
     no_ask_cents: Optional[int] = None
     last_price_cents: Optional[int] = None
-
     yes_bid_size: float = 0.0
     yes_ask_size: float = 0.0
     volume: float = 0.0
     open_interest: float = 0.0
-
     last_update_ts: int = 0
     last_logged_signal_ts: int = 0
-
     mid_history: deque = field(default_factory=lambda: deque(maxlen=1200))
     trade_prices: deque = field(default_factory=lambda: deque(maxlen=1200))
     trade_sizes: deque = field(default_factory=lambda: deque(maxlen=1200))
@@ -470,7 +401,6 @@ class MarketRealtimeState:
         self.title = market.get("title", self.title)
         self.category = market.get("category", self.category)
         self.close_ts = iso_to_ts(market.get("close_time")) or self.close_ts
-
         yb = market.get("yes_bid")
         ya = market.get("yes_ask")
         nb = market.get("no_bid")
@@ -481,10 +411,8 @@ class MarketRealtimeState:
         self.no_bid_cents = safe_int(nb, self.no_bid_cents or 0) if nb is not None else self.no_bid_cents
         self.no_ask_cents = safe_int(na, self.no_ask_cents or 0) if na is not None else self.no_ask_cents
         self.last_price_cents = safe_int(lp, self.last_price_cents or 0) if lp is not None else self.last_price_cents
-
         self.volume = max(self.volume, fp_to_float(market.get("volume")) or fp_to_float(market.get("volume_fp")))
         self.open_interest = max(self.open_interest, fp_to_float(market.get("open_interest")) or fp_to_float(market.get("open_interest_fp")))
-
         now = now_ts()
         self.last_update_ts = now
         mid = self.mid_price()
@@ -599,11 +527,6 @@ class MarketRealtimeState:
         return round(statistics.pstdev(vals), 6)
 
 
-# ==============================
-# Universe / ranking / labels
-# ==============================
-
-
 def compute_rank_score(state: MarketRealtimeState, cfg: CollectorConfig) -> float:
     spread = state.spread_cents()
     if spread is None:
@@ -672,7 +595,6 @@ def hard_filter_passes(state: MarketRealtimeState, cfg: CollectorConfig) -> Tupl
     bid = state.yes_bid_cents
     spread = state.spread_cents()
     htc = state.hours_to_close()
-
     if ask is None:
         reasons.append("missing_yes_ask")
     if bid is None:
@@ -710,15 +632,12 @@ def compute_label_from_snapshots(signal_row: sqlite3.Row, snaps: List[sqlite3.Ro
     entry = safe_int(signal_row["hypothetical_entry_price_cents"])
     target = safe_int(signal_row["hypothetical_target_price_cents"])
     stop = safe_int(signal_row["hypothetical_stop_price_cents"])
-
     hit_target_first = 0
     hit_stop_first = 0
     label_result = "timed_out_flat"
-
     max_favorable = -10**9
     max_adverse = 10**9
     final_move = 0
-
     for s in snaps:
         best_bid = s["yes_bid_cents"] if s["yes_bid_cents"] is not None else s["last_price_cents"]
         if best_bid is None:
@@ -726,7 +645,6 @@ def compute_label_from_snapshots(signal_row: sqlite3.Row, snaps: List[sqlite3.Ro
         move = safe_int(best_bid) - entry
         max_favorable = max(max_favorable, move)
         max_adverse = min(max_adverse, move)
-
         if best_bid >= target:
             hit_target_first = 1
             label_result = "hit_target_first"
@@ -738,7 +656,6 @@ def compute_label_from_snapshots(signal_row: sqlite3.Row, snaps: List[sqlite3.Ro
             final_move = move
             break
         final_move = move
-
     if hit_target_first == 0 and hit_stop_first == 0:
         if final_move > 0:
             label_result = "timed_out_profit"
@@ -746,15 +663,12 @@ def compute_label_from_snapshots(signal_row: sqlite3.Row, snaps: List[sqlite3.Ro
             label_result = "timed_out_loss"
         else:
             label_result = "timed_out_flat"
-
     final_return_pct = (final_move / entry) if entry > 0 else 0.0
     quality = 1 if label_result == "hit_target_first" else 0
-
     if max_favorable == -10**9:
         max_favorable = 0
     if max_adverse == 10**9:
         max_adverse = 0
-
     return {
         "status": "labeled",
         "label_ts": now_ts(),
@@ -772,40 +686,25 @@ def compute_label_from_snapshots(signal_row: sqlite3.Row, snaps: List[sqlite3.Ro
     }
 
 
-# ==============================
-# Collector app
-# ==============================
-
-
-import tempfile
-
 class SignalCollectorApp:
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
         api_key = os.environ.get("KALSHI_API_KEY_ID", "").strip()
         key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "").strip()
         key_pem = os.environ.get("KALSHI_PRIVATE_KEY_PEM", "").strip()
-
         if not api_key:
             raise SystemExit("Missing KALSHI_API_KEY_ID")
-
         if key_pem:
             tmp_dir = "/app/data" if os.path.exists("/app/data") else tempfile.gettempdir()
             temp_key_path = os.path.join(tmp_dir, "kalshi_private_key.pem")
             with open(temp_key_path, "w", encoding="utf-8") as f:
                 f.write(key_pem.replace("\\n", "\n"))
             key_path = temp_key_path
-
         if not key_path or not os.path.exists(key_path):
-            raise SystemExit(
-                "Missing or invalid Kalshi private key. "
-                "Use KALSHI_PRIVATE_KEY_PEM or KALSHI_PRIVATE_KEY_PATH."
-            )
-
+            raise SystemExit("Missing or invalid Kalshi private key. Use KALSHI_PRIVATE_KEY_PEM or KALSHI_PRIVATE_KEY_PATH.")
         self.auth = KalshiAuth(api_key, key_path)
         self.rest = KalshiREST(self.auth, cfg.rest_base_url, cfg.timeout_seconds)
         self.db = CollectorDB(cfg.db_path)
-
         self.markets_meta: Dict[str, Dict[str, Any]] = {}
         self.states: Dict[str, MarketRealtimeState] = {}
         self.ws = None
@@ -813,13 +712,40 @@ class SignalCollectorApp:
         self.last_snapshot_flush = 0
         self.last_summary = 0
         self.run_started_ts = now_ts()
-        
+
     def refresh_universe(self) -> None:
         markets = self.rest.get_all_open_markets(limit=3000)
         new_meta: Dict[str, Dict[str, Any]] = {}
+        current_ts = now_ts()
         for m in markets:
             ticker = m.get("ticker")
             if not ticker:
+                continue
+            yes_ask = m.get("yes_ask")
+            if yes_ask is None:
+                yes_ask = cents_from_dollars_str(m.get("yes_ask_dollars"))
+            else:
+                yes_ask = safe_int(yes_ask)
+            yes_bid = m.get("yes_bid")
+            if yes_bid is None:
+                yes_bid = cents_from_dollars_str(m.get("yes_bid_dollars"))
+            else:
+                yes_bid = safe_int(yes_bid)
+            volume = fp_to_float(m.get("volume")) or fp_to_float(m.get("volume_fp"))
+            open_interest = fp_to_float(m.get("open_interest")) or fp_to_float(m.get("open_interest_fp"))
+            close_ts = iso_to_ts(m.get("close_time"))
+            hours_to_close = ((close_ts - current_ts) / 3600.0) if close_ts else None
+            if yes_ask is None:
+                continue
+            if yes_ask < self.cfg.required_min_yes_price_cents or yes_ask > self.cfg.required_max_yes_price_cents:
+                continue
+            if yes_bid is not None and (yes_ask - yes_bid) > self.cfg.max_spread_cents:
+                continue
+            if volume < self.cfg.min_volume_contracts:
+                continue
+            if open_interest < self.cfg.min_open_interest_contracts:
+                continue
+            if hours_to_close is None or hours_to_close < self.cfg.min_hours_to_close or hours_to_close > self.cfg.max_hours_to_close:
                 continue
             new_meta[ticker] = m
             if ticker not in self.states:
@@ -838,7 +764,7 @@ class SignalCollectorApp:
             ssl=ssl.create_default_context(),
             ping_interval=20,
             ping_timeout=20,
-            max_size=8 * 1024 * 1024,
+            max_size=4 * 1024 * 1024,
         )
 
     async def subscribe_ws(self) -> None:
@@ -847,16 +773,14 @@ class SignalCollectorApp:
         market_tickers = list(self.markets_meta.keys())
         if not market_tickers:
             return
-
-        # chunk subscriptions to avoid oversized messages
         chunk_size = 100
         chunks = [market_tickers[i:i + chunk_size] for i in range(0, len(market_tickers), chunk_size)]
         msg_id = 1
         for chunk in chunks:
-subs = [
-    {"id": msg_id, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_tickers": chunk}},
-]
-msg_id += 1
+            subs = [
+                {"id": msg_id, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_tickers": chunk}},
+            ]
+            msg_id += 1
             for s in subs:
                 await self.ws.send(json.dumps(s))
                 await asyncio.sleep(0.05)
@@ -880,11 +804,6 @@ msg_id += 1
                     state = self.states.setdefault(ticker, MarketRealtimeState(ticker=ticker))
                     if msg_type == "ticker":
                         state.update_from_ticker(payload)
-                    elif msg_type == "trade":
-                        state.update_from_trade(payload)
-                    elif msg_type in ("orderbook_delta", "orderbook_snapshot"):
-                        if msg_type == "orderbook_delta":
-                            state.update_from_orderbook_delta(payload)
             except Exception as e:
                 log_line(self.cfg, f"WS loop error: {e}. reconnecting in 3s")
                 await asyncio.sleep(3)
@@ -917,11 +836,9 @@ msg_id += 1
         passes, fail_reasons = hard_filter_passes(state, self.cfg)
         if not passes:
             return
-
         now = now_ts()
         if now - state.last_logged_signal_ts < self.cfg.per_market_signal_cooldown_seconds:
             return
-
         ask = state.yes_ask_cents
         if ask is None:
             return
@@ -930,7 +847,6 @@ msg_id += 1
         signal_type = choose_signal_type(state)
         rank_score = compute_rank_score(state, self.cfg)
         reason_codes = build_reason_codes(state, self.cfg)
-
         signal_id = str(uuid.uuid4())
         row = {
             "signal_id": signal_id,
@@ -1002,7 +918,6 @@ msg_id += 1
                         await self.ws.close()
                     except Exception:
                         pass
-
             if (now - self.last_snapshot_flush) >= self.cfg.snapshot_every_seconds:
                 snap_count = 0
                 signal_count = 0
@@ -1019,33 +934,25 @@ msg_id += 1
                 self.db.upsert_stat("last_snapshot_count", str(snap_count))
                 if signal_count:
                     self.db.upsert_stat("last_signal_burst_count", str(signal_count))
-
             labeled = self.label_ready_signals()
             if labeled:
                 self.db.upsert_stat("last_labeled_batch_count", str(labeled))
-
             if (now - self.last_summary) >= self.cfg.summary_every_seconds:
                 counts = self.db.summary_counts()
                 tracked = len(self.states)
-                log_line(
-                    self.cfg,
-                    f"tracked_markets={tracked} pending={counts.get('pending',0)} labeled={counts.get('labeled',0)}"
-                )
+                log_line(self.cfg, f"tracked_markets={tracked} pending={counts.get('pending',0)} labeled={counts.get('labeled',0)}")
                 self.last_summary = now
-
             await asyncio.sleep(1)
 
     async def run(self) -> None:
-        self.refresh_universe()
-        await asyncio.gather(
-            self.ws_loop(),
-            self.periodic_loop(),
-        )
-
-
-# ==============================
-# CLI
-# ==============================
+        try:
+            log_line(self.cfg, "collector starting")
+            self.refresh_universe()
+            log_line(self.cfg, f"collector universe loaded markets={len(self.markets_meta)}")
+            await asyncio.gather(self.ws_loop(), self.periodic_loop())
+        except Exception as e:
+            log_line(self.cfg, f"collector fatal error: {e}")
+            raise
 
 
 def load_config(path: Optional[str]) -> CollectorConfig:
@@ -1059,18 +966,7 @@ def load_config(path: Optional[str]) -> CollectorConfig:
             setattr(cfg, k, v)
     return cfg
 
-async def run(self) -> None:
-    try:
-        log_line(self.cfg, "collector starting")
-        self.refresh_universe()
-        log_line(self.cfg, f"collector universe loaded markets={len(self.markets_meta)}")
-        await asyncio.gather(
-            self.ws_loop(),
-            self.periodic_loop(),
-        )
-    except Exception as e:
-        log_line(self.cfg, f"collector fatal error: {e}")
-        raise
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=None)
