@@ -815,7 +815,7 @@ class SignalCollectorApp:
         self.run_started_ts = now_ts()
         
     def refresh_universe(self) -> None:
-        markets = self.rest.get_all_open_markets(limit=100000)
+        markets = self.rest.get_all_open_markets(limit=3000)
         new_meta: Dict[str, Dict[str, Any]] = {}
         for m in markets:
             ticker = m.get("ticker")
@@ -849,16 +849,14 @@ class SignalCollectorApp:
             return
 
         # chunk subscriptions to avoid oversized messages
-        chunk_size = 500
+        chunk_size = 100
         chunks = [market_tickers[i:i + chunk_size] for i in range(0, len(market_tickers), chunk_size)]
         msg_id = 1
         for chunk in chunks:
-            subs = [
-                {"id": msg_id, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_tickers": chunk}},
-                {"id": msg_id + 1, "cmd": "subscribe", "params": {"channels": ["trade"], "market_tickers": chunk}},
-                {"id": msg_id + 2, "cmd": "subscribe", "params": {"channels": ["orderbook_delta"], "market_tickers": chunk}},
-            ]
-            msg_id += 3
+subs = [
+    {"id": msg_id, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_tickers": chunk}},
+]
+msg_id += 1
             for s in subs:
                 await self.ws.send(json.dumps(s))
                 await asyncio.sleep(0.05)
